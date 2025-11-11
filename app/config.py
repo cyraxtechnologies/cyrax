@@ -28,28 +28,33 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
     
-    # WhatsApp Business API
+    # WhatsApp Business API (Meta/Facebook)
     WHATSAPP_API_URL: str = "https://graph.facebook.com/v18.0"
-    WHATSAPP_PHONE_NUMBER_ID: str
-    WHATSAPP_BUSINESS_ACCOUNT_ID: str
-    WHATSAPP_ACCESS_TOKEN: str
-    WHATSAPP_VERIFY_TOKEN: str
-    WHATSAPP_WEBHOOK_SECRET: str
+    WHATSAPP_PHONE_NUMBER_ID: str = ""
+    WHATSAPP_BUSINESS_ACCOUNT_ID: str = ""
+    WHATSAPP_ACCESS_TOKEN: str = ""
+    WHATSAPP_VERIFY_TOKEN: str = ""
+    WHATSAPP_WEBHOOK_SECRET: str = ""
 
-    # Twilio (ADD THESE NEW LINES)
-    TWILIO_ACCOUNT_SID: str
-    TWILIO_AUTH_TOKEN: str
-    TWILIO_WHATSAPP_NUMBER: str
+    # Twilio WhatsApp (Alternative to Meta - easier to set up)
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_WHATSAPP_NUMBER: str = ""
     
-    # AI Services
+    # AI Services - OpenAI
     OPENAI_API_KEY: str
-    OPENAI_MODEL: str = "gpt-4-turbo-preview"
-    OPENAI_WHISPER_MODEL: str = "whisper-1"
+    OPENAI_MODEL: str = "gpt-4o-mini"  # Updated to faster, cheaper model
+    OPENAI_VISION_MODEL: str = "gpt-4o"  # For image recognition (NEW!)
+    OPENAI_WHISPER_MODEL: str = "whisper-1"  # For voice transcription (NEW!)
+    
+    # Feature Flags (NEW!)
+    ENABLE_VOICE_NOTES: bool = True
+    ENABLE_IMAGE_RECOGNITION: bool = True
     
     # Payment Gateway (PayStack for South Africa)
-    PAYSTACK_SECRET_KEY: str
-    PAYSTACK_PUBLIC_KEY: str
-    PAYSTACK_WEBHOOK_SECRET: str
+    PAYSTACK_SECRET_KEY: str = ""
+    PAYSTACK_PUBLIC_KEY: str = ""
+    PAYSTACK_WEBHOOK_SECRET: str = ""
     PAYSTACK_BASE_URL: str = "https://api.paystack.co"
     
     # Security
@@ -69,10 +74,11 @@ class Settings(BaseSettings):
     # Monitoring
     SENTRY_DSN: Optional[str] = None
     
-    # File Upload
+    # File Upload (NEW!)
     MAX_FILE_SIZE_MB: int = 10
     ALLOWED_IMAGE_TYPES: list = ["image/jpeg", "image/png", "image/webp"]
     ALLOWED_AUDIO_TYPES: list = ["audio/ogg", "audio/mpeg", "audio/mp4"]
+    MEDIA_DIR: str = "media"  # Directory for temporary media storage
     
     # Celery
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
@@ -86,6 +92,8 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        # Allow extra fields (for backward compatibility)
+        extra = "ignore"  # This prevents the validation error!
 
 
 # Singleton instance
@@ -93,6 +101,8 @@ settings = Settings()
 
 
 # Logging configuration
+import logging.config
+
 LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -161,4 +171,4 @@ class UserStatus:
     PENDING_VERIFICATION = "pending_verification"
     ACTIVE = "active"
     SUSPENDED = "suspended"
-    BLOCKED = "blocked"
+    BLOCKED = "blocked" 

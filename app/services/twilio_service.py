@@ -1,6 +1,6 @@
 """
 Twilio WhatsApp Service
-Handles WhatsApp messaging via Twilio
+Handles WhatsApp messaging via Twilio with full media support
 """
 import httpx
 import logging
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 class TwilioWhatsAppService:
     """
     Twilio WhatsApp client for sending/receiving messages.
+    Supports text, images, and audio (voice notes).
     """
     
     def __init__(self):
@@ -80,31 +81,72 @@ class TwilioWhatsAppService:
     def parse_webhook(form_data: Dict) -> Optional[Dict]:
         """
         Parse incoming webhook from Twilio.
+        Supports text, images, and audio (voice notes).
         
         Args:
             form_data: Form data from Twilio webhook
             
         Returns:
-            Parsed message data
+            Parsed message data with type, media URLs, etc.
         """
         try:
-            # Twilio sends form data, not JSON
+            # Basic message info
             from_number = form_data.get("From", "").replace("whatsapp:", "")
             body = form_data.get("Body", "")
             message_sid = form_data.get("MessageSid", "")
             profile_name = form_data.get("ProfileName", "")
             
-            return {
+            # Check for media (images, audio)
+            num_media = int(form_data.get("NumMedia", "0"))
+            
+            parsed = {
                 "message_id": message_sid,
                 "from_phone": from_number,
                 "from_name": profile_name,
-                "text": body,
-                "type": "text",
                 "timestamp": None
             }
             
+            # Handle media messages
+            if num_media > 0:
+                # Get first media item (Twilio can send multiple)
+                media_content_type = form_data.get("MediaContentType0", "")
+                media_url = form_data.get("MediaUrl0", "")
+                
+                # Determine message type based on content type
+                if media_content_type.startswith("image/"):
+                    parsed["type"] = "image"
+                    parsed["media_url"] = media_url
+                    parsed["mime_type"] = media_content_type
+                    parsed["caption"] = body  # Text sent with image
+                    
+                elif media_content_type.startswith("audio/"):
+                    parsed["type"] = "audio"
+                    parsed["media_url"] = media_url
+                    parsed["mime_type"] = media_content_type
+                    
+                elif media_content_type.startswith("video/"):
+                    parsed["type"] = "video"
+                    parsed["media_url"] = media_url
+                    parsed["mime_type"] = media_content_type
+                    parsed["caption"] = body
+                    
+                else:
+                    # Unknown media type, treat as document
+                    parsed["type"] = "document"
+                    parsed["media_url"] = media_url
+                    parsed["mime_type"] = media_content_type
+                    
+                logger.info(f"Parsed {parsed['type']} message with media: {media_url}")
+                
+            else:
+                # Text-only message
+                parsed["type"] = "text"
+                parsed["text"] = body
+                
+            return parsed
+            
         except Exception as e:
-            logger.error(f"Failed to parse webhook: {str(e)}")
+            logger.error(f"Failed to parse webhook: {str(e)}", exc_info=True)
             return None
 
 

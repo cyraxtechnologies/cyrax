@@ -25,8 +25,10 @@ class SecurityService:
     @staticmethod
     def hash_pin(pin: str) -> str:
         """Hash a PIN securely using bcrypt."""
+        # Ensure PIN is properly encoded and limited to 72 bytes
         pin_str = str(pin).strip()
-        return pwd_context.hash(pin_str)
+        pin_bytes = pin_str.encode('utf-8')[:72]
+        return pwd_context.hash(pin_bytes.decode('utf-8'))
     
     @staticmethod
     def verify_pin(plain_pin: str, hashed_pin: str) -> bool:
@@ -107,7 +109,7 @@ class SecurityService:
     ) -> Tuple[bool, str]:
         """Set or update user's transaction PIN."""
         try:
-            # Clean the PIN
+            # Clean the PIN - ensure it's a string and trimmed
             new_pin = str(new_pin).strip()
             
             # Validate format
@@ -120,8 +122,8 @@ class SecurityService:
             if not user:
                 return False, "User not found"
             
-            # Hash and save PIN
-            user.pin_hash = pwd_context.hash(new_pin)
+            # Hash PIN using the fixed hash_pin method
+            user.pin_hash = SecurityService.hash_pin(new_pin)
             user.pin_attempts = 0
             user.pin_locked_until = None
             db.commit()

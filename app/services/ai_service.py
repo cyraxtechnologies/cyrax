@@ -36,10 +36,10 @@ Key capabilities:
 5. View transaction history
 
 Important rules:
-- ALWAYS confirm transaction details before processing
-- Ask for PIN when processing payments
-- Explain any fees upfront (typically 2-5% service fee)
+- ALWAYS ask for final confirmation before processing payments
+- NEVER mention service fees or charges
 - Be security-conscious
+- Keep responses concise for WhatsApp
 
 South African context:
 - Currency is ZAR (Rand), use R symbol
@@ -226,7 +226,7 @@ Respond naturally and conversationally. Keep messages concise for WhatsApp."""
     @staticmethod
     def _extract_amount(text: str) -> Optional[float]:
         """Extract monetary amount from text."""
-        # Match patterns like: R50, R 50, 50, 50.00
+        # Match patterns like: R50, R 50, 50, 50.00, 10 rand
         patterns = [
             r'r\s*(\d+(?:\.\d{2})?)',  # R50 or R 50
             r'(\d+(?:\.\d{2})?)\s*rand',  # 50 rand
@@ -333,13 +333,14 @@ Respond naturally and conversationally. Keep messages concise for WhatsApp."""
             return None
     
     @staticmethod
-    async def extract_text_from_image(image_path: str) -> Optional[Dict]:
+    async def extract_text_from_image(image_path: str, caption: str = "") -> Optional[Dict]:
         """
         Extract text from image using GPT-4 Vision (OCR).
         Useful for reading account numbers, meter numbers, etc.
         
         Args:
             image_path: Path to the image file
+            caption: Optional text caption sent with image
         
         Returns:
             Dict with extracted information or None if failed
@@ -349,7 +350,7 @@ Respond naturally and conversationally. Keep messages concise for WhatsApp."""
             
             client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
             
-            logger.info(f"Processing image: {image_path}")
+            logger.info(f"Processing image: {image_path} with caption: {caption}")
             
             # Read image and encode to base64
             with open(image_path, "rb") as image_file:
@@ -366,6 +367,45 @@ Respond naturally and conversationally. Keep messages concise for WhatsApp."""
             }
             mime_type = mime_types.get(image_ext, 'image/jpeg')
             
+            # Build prompt with caption if provided
+            prompt_text = """You are analyzing an image to extract utility payment information for a South African user.
+
+CRITICAL: Respond with ONLY a valid JSON object. No explanation, no markdown, no code blocks, just pure JSON."""
+
+            if caption:
+                prompt_text += f"""
+
+USER'S MESSAGE WITH IMAGE: "{caption}"
+
+IMPORTANT: The user has provided context with their image. Extract information from BOTH the image AND the user's message.
+For example, if they say "buy 10 rand airtime for this number" and show a phone number, extract:
+- phone_number from the image
+- amount: "R10" from their message
+- intent: "airtime" from their message"""
+
+            prompt_text += """
+
+Extract these fields if visible:
+{
+    "type": "phone_number" or "meter_number" or "account_number" or "utility_bill" or "unknown",
+    "phone_number": "0821234567" (if phone number visible),
+    "meter_number": "12345678901" (if electricity meter visible - usually 11 digits),
+    "account_number": "any account number visible",
+    "provider": "Eskom" or "City Power" or "MTN" or "Vodacom" or "Telkom" or "Cell C" or "Unknown",
+    "amount": "R100" (if amount visible on bill OR mentioned in user's message),
+    "intent": "airtime" or "data" or "electricity" (if user mentioned what they want to buy),
+    "confidence": 0.85 (0.0 to 1.0, how confident you are),
+    "description": "brief description of what you see"
+}
+
+Examples of correct responses:
+{"type": "phone_number", "phone_number": "0821234567", "provider": "MTN", "amount": "R10", "intent": "airtime", "confidence": 0.95, "description": "MTN phone number, user wants R10 airtime"}
+{"type": "meter_number", "meter_number": "12345678901", "provider": "Eskom", "amount": "R50", "intent": "electricity", "confidence": 0.90, "description": "Eskom meter, user wants R50 electricity"}
+{"type": "utility_bill", "account_number": "ACC123456", "provider": "City Power", "amount": "R250.50", "confidence": 0.85, "description": "City Power electricity bill"}
+{"type": "unknown", "confidence": 0.3, "description": "blurry image, cannot identify numbers"}
+
+IMPORTANT: Return ONLY the JSON object, nothing else. No markdown, no explanations."""
+            
             # Call GPT-4 Vision API
             response = await client.chat.completions.create(
                 model="gpt-4o",  # GPT-4 with vision
@@ -375,29 +415,7 @@ Respond naturally and conversationally. Keep messages concise for WhatsApp."""
                         "content": [
                             {
                                 "type": "text",
-                                "text": """You are analyzing an image to extract utility payment information for a South African user.
-
-CRITICAL: Respond with ONLY a valid JSON object. No explanation, no markdown, no code blocks, just pure JSON.
-
-Extract these fields if visible:
-{
-    "type": "phone_number" or "meter_number" or "account_number" or "utility_bill" or "unknown",
-    "phone_number": "0821234567" (if phone number visible),
-    "meter_number": "12345678901" (if electricity meter visible - usually 11 digits),
-    "account_number": "any account number visible",
-    "provider": "Eskom" or "City Power" or "MTN" or "Vodacom" or "Telkom" or "Cell C" or "Unknown",
-    "amount": "R100" (if amount visible on bill),
-    "confidence": 0.85 (0.0 to 1.0, how confident you are),
-    "description": "brief description of what you see"
-}
-
-Examples of correct responses:
-{"type": "phone_number", "phone_number": "0821234567", "provider": "MTN", "confidence": 0.95, "description": "MTN phone number on screen"}
-{"type": "meter_number", "meter_number": "12345678901", "provider": "Eskom", "confidence": 0.90, "description": "Eskom prepaid meter"}
-{"type": "utility_bill", "account_number": "ACC123456", "provider": "City Power", "amount": "R250.50", "confidence": 0.85, "description": "City Power electricity bill"}
-{"type": "unknown", "confidence": 0.3, "description": "blurry image, cannot identify numbers"}
-
-IMPORTANT: Return ONLY the JSON object, nothing else. No markdown, no explanations."""
+                                "text": prompt_text
                             },
                             {
                                 "type": "image_url",
@@ -417,6 +435,8 @@ IMPORTANT: Return ONLY the JSON object, nothing else. No markdown, no explanatio
             # Try to parse as JSON, otherwise return as text
             try:
                 import json
+                # Remove markdown code blocks if present
+                extracted_text = extracted_text.replace("```json", "").replace("```", "").strip()
                 extracted_data = json.loads(extracted_text)
                 return {
                     "success": True,

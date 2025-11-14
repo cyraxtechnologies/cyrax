@@ -1,5 +1,5 @@
 """
-Enhanced WhatsApp Router with Voice & Image Support
+Enhanced WhatsApp Router with Onboarding, Voice & Image Support
 Handles text, voice notes, and images via Twilio WhatsApp
 """
 from fastapi import APIRouter, Request, Depends, BackgroundTasks
@@ -16,9 +16,10 @@ import httpx
 from app.database import get_db
 from app.models.user import User, UserStatus
 from app.models.conversation import Conversation
-from app.services.twilio_service import twilio_whatsapp
+from app.services.whatsapp_api_service import whatsapp_api  # ← UPDATED: WhatsApp API
 from app.services.transaction_service import transaction_service
 from app.services.security_service import security_service
+from app.services.onboarding_service import onboarding_service
 
 # Import the AI service (now enhanced with voice & image)
 from app.services.ai_service import ai_service
@@ -32,18 +33,39 @@ MEDIA_DIR = Path("media")
 MEDIA_DIR.mkdir(exist_ok=True)
 
 
+@router.get("/")
+async def verify_webhook(request: Request):
+    """
+    Meta webhook verification endpoint.
+    When you add webhook URL in CRM dashboard, Meta sends GET request with 'challange' parameter.
+    Must respond with the same challange value to verify.
+    """
+    challenge = request.query_params.get("challange")  # Note: their typo in docs
+    if challenge:
+        logger.info(f"Webhook verification: responding with challenge")
+        return PlainTextResponse(challenge)
+    return PlainTextResponse("No challenge parameter")
+
+
 @router.post("/")
 async def receive_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """Main webhook endpoint for receiving WhatsApp messages from Twilio."""
+    """Main webhook endpoint for receiving WhatsApp messages."""
     try:
-        form_data = await request.form()
-        logger.info(f"Webhook received: {dict(form_data)}")
-        
-        message = twilio_whatsapp.parse_webhook(dict(form_data))
+        # Try to parse as JSON first (WhatsApp API format)
+        try:
+            data = await request.json()
+            logger.info(f"Webhook received (JSON): {data}")
+            message = whatsapp_api.parse_webhook(data)
+        except:
+            # Fallback to form data (Twilio format - for backwards compatibility)
+            form_data = await request.form()
+            logger.info(f"Webhook received (Form): {dict(form_data)}")
+            # Convert form to dict for parsing
+            message = whatsapp_api.parse_webhook(dict(form_data))
         
         if not message:
             return PlainTextResponse("OK")
@@ -67,29 +89,41 @@ async def process_message(message: dict, db: Session):
     - Text messages
     - Voice notes (transcribed with Whisper)
     - Images (OCR with GPT-4 Vision)
+    - User onboarding (NEW!)
     """
     try:
         phone_number = message.get("from_phone")
         message_id = message.get("message_id")
         message_type = message.get("type")
+        from_name = message.get("from_name", "")
         
         logger.info(f"Processing {message_type} message from {phone_number}")
         
         # Get or create user
         user = db.query(User).filter(User.phone_number == phone_number).first()
+        
+        # NEW: Check if this is a brand new user
         if not user:
             user = User(
                 phone_number=phone_number,
-                whatsapp_name=message.get("from_name"),
-                status=UserStatus.ACTIVE  # Auto-activate for utility bill service
+                whatsapp_name=from_name,
+                status=UserStatus.PENDING_VERIFICATION  # Start as pending
             )
             db.add(user)
             db.commit()
             db.refresh(user)
             
-            await send_welcome_message(phone_number, message.get("from_name"))
+            # Send welcome message explaining onboarding
+            await send_welcome_message_new_user(phone_number, from_name)
             return
         
+        # NEW: Check if user needs to complete onboarding
+        if onboarding_service.should_onboard_user(user):
+            # Send welcome Flow for new users only
+            await send_welcome_message_new_user(phone_number, user.whatsapp_name or "there")
+            return
+        
+        # User is fully onboarded - proceed with normal processing
         user.last_active_at = datetime.utcnow()
         db.commit()
         
@@ -99,25 +133,126 @@ async def process_message(message: dict, db: Session):
         if message_type == "text":
             message_text = message.get("text", "")
             
+            # Handle Flow response
+            if message_text == "FLOW_RESPONSE":
+                flow_data_json = message.get("flow_data", "{}")
+                try:
+                    import json
+                    flow_data = json.loads(flow_data_json)
+                    
+                    # Process onboarding with Flow data
+                    success, msg, updated_user = await onboarding_service.process_flow_response(
+                        phone_number,
+                        flow_data,
+                        db
+                    )
+                    
+                    await whatsapp_api.send_message(phone_number, msg)
+                    
+                    if success:
+                        await send_menu(phone_number)
+                    
+                    return
+                except Exception as e:
+                    logger.error(f"Flow processing error: {str(e)}")
+                    await whatsapp_api.send_message(
+                        phone_number,
+                        "❌ Registration error. Please try again."
+                    )
+                    return
+            
+            # ADMIN COMMANDS - Check first before anything else
+            if phone_number == "+27763514028":  # Your admin number
+                if message_text.startswith("/reset"):
+                    user.first_name = None
+                    user.last_name = None
+                    user.id_number = None
+                    user.is_fica_compliant = False
+                    user.status = UserStatus.PENDING_VERIFICATION
+                    db.commit()
+                    await whatsapp_api.send_message(phone_number, "✅ Account reset. Send 'Hi' to start fresh.")
+                    return
+                
+                elif message_text.startswith("/complete"):
+                    from datetime import date
+                    user.first_name = "Test"
+                    user.last_name = "User"
+                    user.id_number = "9001011234567"
+                    user.date_of_birth = date(1990, 1, 1)
+                    user.is_fica_compliant = True
+                    user.is_id_verified = True
+                    user.status = UserStatus.ACTIVE
+                    db.commit()
+                    await whatsapp_api.send_message(phone_number, "✅ Account activated!")
+                    return
+            
+            # Handle button responses (yes/no from confirmations + menu buttons)
+            if message_text.lower() in ["yes", "no", "info", "airtime", "data", "electricity"]:
+                if message_text.lower() == "yes":
+                    # User confirmed - process transaction
+                    await whatsapp_api.send_delay()
+                    await whatsapp_api.send_message(
+                        phone_number,
+                        "✅ Processing your request...\n\n⚠️ Note: Your wallet balance is R0.00. Please top up to complete purchases."
+                    )
+                    return
+                elif message_text.lower() == "no":
+                    # User declined
+                    await whatsapp_api.send_message(
+                        phone_number,
+                        "❌ Transaction cancelled. Let me know if you need anything else!"
+                    )
+                    return
+                elif message_text.lower() == "info":
+                    # User wants more info
+                    await whatsapp_api.send_delay()
+                    await whatsapp_api.send_message(
+                        phone_number,
+                        "ℹ️ *About Cyrax*\n\nI help you:\n• Buy airtime for any SA network\n• Get data bundles\n• Pay electricity bills\n\nSecure, fast, and easy! 🔐\n\nReady to register? Reply YES"
+                    )
+                    return
+                elif message_text.lower() == "airtime":
+                    # User clicked Buy Airtime button
+                    await whatsapp_api.send_delay()
+                    await whatsapp_api.send_message(
+                        phone_number,
+                        "📱 *Buy Airtime*\n\nTell me:\n• Phone number\n• Amount (R5 - R1000)\n• Network (optional)\n\nExample: \"Buy R50 MTN airtime for 0821234567\"\n\nOr send a photo of the number!"
+                    )
+                    return
+                elif message_text.lower() == "data":
+                    # User clicked Buy Data button
+                    await whatsapp_api.send_delay()
+                    await whatsapp_api.send_message(
+                        phone_number,
+                        "📊 *Buy Data*\n\nTell me:\n• Phone number\n• Data amount (1GB, 2GB, etc.)\n• Network\n\nExample: \"Buy 1GB Vodacom data for 0821234567\""
+                    )
+                    return
+                elif message_text.lower() == "electricity":
+                    # User clicked Recharge Meter button
+                    await whatsapp_api.send_delay()
+                    await whatsapp_api.send_message(
+                        phone_number,
+                        "⚡ *Recharge Meter*\n\nTell me:\n• Meter number (11 digits)\n• Amount (R10 - R5000)\n\nExample: \"Pay R100 electricity for meter 12345678901\"\n\nOr send a photo of your meter!"
+                    )
+                    return
+            
         elif message_type == "audio":
             # Download and transcribe voice note
             message_text = await handle_voice_note(message)
             if not message_text:
-                await twilio_whatsapp.send_message(
+                await whatsapp_api.send_message(
                     phone_number,
                     "Sorry, I couldn't understand your voice note. Please try again or send a text message. 🎤"
                 )
                 return
             
-            # Send confirmation that we understood
-            await twilio_whatsapp.send_message(
-                phone_number,
-                f"🎤 I heard: \"{message_text}\"\n\nLet me help you with that..."
-            )
+            # Process directly without echoing
             
         elif message_type == "image":
             # Download and process image with OCR
-            image_result = await handle_image(message)
+            # Get caption if provided
+            caption = message.get("caption", message.get("text", ""))
+            image_result = await handle_image(message, caption)
             
             if image_result and image_result.get("success"):
                 extracted_data = image_result.get("data", {})
@@ -125,28 +260,43 @@ async def process_message(message: dict, db: Session):
                 
                 # Check if extraction was successful
                 if confidence < 0.5:
-                    await twilio_whatsapp.send_message(
+                    await whatsapp_api.send_message(
                         phone_number,
                         "📸 I can see your image, but it's not clear enough. Please try:\n• Better lighting\n• Closer shot\n• Focus on the numbers"
                     )
                     return
                 
                 image_type = extracted_data.get("type", "unknown")
+                amount = extracted_data.get("amount", "")  # Get amount from caption
+                intent = extracted_data.get("intent", "")  # Get intent from caption
                 
                 # PHONE NUMBER DETECTED - Airtime Intent
                 if image_type == "phone_number" or "phone_number" in extracted_data:
                     phone = extracted_data.get("phone_number", "")
                     provider = extracted_data.get("provider", "Unknown")
+                    amount = extracted_data.get("amount", "")
                     
                     if phone:
-                        await twilio_whatsapp.send_message(
-                            phone_number,
-                            f"📱 I found:\n• Phone: {phone}\n• Network: {provider}\n\nHow much airtime would you like to buy?"
-                        )
-                        # Set intent for airtime purchase
-                        message_text = f"buy airtime for {phone}"
+                        # If amount already provided in caption, confirm with buttons
+                        if amount and intent == "airtime":
+                            await whatsapp_api.send_buttons(
+                                phone_number,
+                                f"📱 Confirm Airtime Purchase\n\n• Phone: {phone}\n• Network: {provider}\n• Amount: {amount}\n\nReady to proceed?",
+                                [
+                                    {"type": "reply", "reply": {"id": "yes", "title": "✅ Yes"}},
+                                    {"type": "reply", "reply": {"id": "no", "title": "❌ No"}}
+                                ]
+                            )
+                            return  # Don't process with AI
+                        else:
+                            # Amount missing - ask for it
+                            await whatsapp_api.send_message(
+                                phone_number,
+                                f"📱 I found:\n• Phone: {phone}\n• Network: {provider if provider != 'Unknown' else 'Will detect automatically'}\n\n💰 How much airtime? (e.g., R10, R20, R50, R100)"
+                            )
+                            return  # Don't process with AI
                     else:
-                        await twilio_whatsapp.send_message(
+                        await whatsapp_api.send_message(
                             phone_number,
                             "📱 I see a phone number but couldn't read it clearly. Please type it or send a clearer photo."
                         )
@@ -158,14 +308,14 @@ async def process_message(message: dict, db: Session):
                     provider = extracted_data.get("provider", "Eskom")
                     
                     if meter:
-                        await twilio_whatsapp.send_message(
+                        await whatsapp_api.send_message(
                             phone_number,
                             f"⚡ I found:\n• Meter: {meter}\n• Provider: {provider}\n\nHow much electricity would you like to buy? (e.g., R50, R100)"
                         )
                         # Set intent for electricity purchase
                         message_text = f"buy electricity for meter {meter}"
                     else:
-                        await twilio_whatsapp.send_message(
+                        await whatsapp_api.send_message(
                             phone_number,
                             "⚡ I see an electricity meter but couldn't read the number. Please type it or send a clearer photo."
                         )
@@ -184,14 +334,14 @@ async def process_message(message: dict, db: Session):
                         bill_msg += f"• Amount Due: {amount}\n"
                     bill_msg += "\nWould you like to pay this bill? Reply YES to confirm."
                     
-                    await twilio_whatsapp.send_message(phone_number, bill_msg)
+                    await whatsapp_api.send_message(phone_number, bill_msg)
                     # Set intent for bill payment
                     message_text = f"pay {provider} bill for account {account} amount {amount}"
                 
                 # UNKNOWN/UNCLEAR IMAGE
                 else:
                     description = extracted_data.get("description", "an image")
-                    await twilio_whatsapp.send_message(
+                    await whatsapp_api.send_message(
                         phone_number,
                         f"📸 I see {description}, but I couldn't identify:\n• Phone number (for airtime)\n• Meter number (for electricity)\n• Utility bill (for payment)\n\nPlease try:\n✓ Close-up of the number\n✓ Good lighting\n✓ Clear focus"
                     )
@@ -199,14 +349,14 @@ async def process_message(message: dict, db: Session):
                     message_text = "help"
             
             else:
-                await twilio_whatsapp.send_message(
+                await whatsapp_api.send_message(
                     phone_number,
                     "Sorry, I couldn't process your image. Please try again with a clearer photo! 📸"
                 )
                 return
         
         else:
-            await twilio_whatsapp.send_message(
+            await whatsapp_api.send_message(
                 phone_number,
                 f"I support text messages, voice notes, and images. Please send one of these! 💬🎤📸"
             )
@@ -229,7 +379,8 @@ async def process_message(message: dict, db: Session):
             "name": user.full_name,
             "phone": user.phone_number,
             "balance": user.balance,
-            "status": user.status.value
+            "status": user.status.value,
+            "is_verified": user.is_fica_compliant  # NEW: Include FICA status
         }
         
         # Get conversation history
@@ -262,17 +413,122 @@ async def process_message(message: dict, db: Session):
         db.commit()
         
         # Send AI response
-        await twilio_whatsapp.send_message(phone_number, ai_result["response"])
+        await whatsapp_api.send_message(phone_number, ai_result["response"])
         
-        # Handle specific intents
-        if ai_result["intent"] == "help" or ai_result["intent"] == "greeting":
+        # Handle specific intents - only send menu for actual help requests
+        if ai_result["intent"] == "help":
             await send_menu(phone_number)
+        elif ai_result["intent"] == "greeting":
+            # Only send menu if this is first message (no conversation history)
+            if len(conversation_history) == 0:
+                await send_menu(phone_number)
         
     except Exception as e:
         logger.error(f"Message processing error: {str(e)}", exc_info=True)
-        await twilio_whatsapp.send_message(
+        await whatsapp_api.send_message(
             phone_number,
             "Sorry, something went wrong. Please try again later. 😅"
+        )
+
+
+async def send_welcome_message_new_user(phone_number: str, name: str):
+    """
+    Send welcome message to new users with Flow button (Xara style).
+    """
+    welcome = f"""Hey {name}! 👋 I'm Cyrax, your AI assistant from Cyrax Technologies! I can handle transactions, schedule payments, analyze your spending, set up recurring transfers and spending limits, and even process voice notes and images! 😊
+
+To keep your account secure, please lock your WhatsApp. 🔒
+
+Ready to get started? Let's begin your onboarding! ✨"""
+    
+    # Send Flow for registration
+    await whatsapp_api.send_flow(
+        phone_number,
+        welcome,
+        "Complete Onboarding",
+        "6916b0d4438bb928d88ac3a2"
+    )
+
+
+async def send_registration_instructions(phone_number: str):
+    """
+    Send registration form instructions (NO PIN).
+    """
+    instructions = """📋 *Account Setup*
+
+Please send your details in this format:
+
+REGISTER [FirstName] [LastName] [ID]
+
+*Example:*
+REGISTER Thabo Mokoena 9001011234567
+
+*Requirements:*
+• ✅ Your South African ID number (13 digits)
+• ✅ Must be 18+ years old
+
+*Your Info is Safe:*
+🔐 ID is verified but never shared
+🔐 FICA compliant
+🔒 Use WhatsApp Chat Lock for security
+
+Ready? Send your details now! 👆"""
+    
+    await whatsapp_api.send_message(phone_number, instructions)
+
+
+async def handle_registration(phone_number: str, message_text: str, user: User, db: Session):
+    """
+    Handle user registration command (NO PIN).
+    Format: REGISTER FirstName LastName IDNumber
+    """
+    try:
+        # Parse registration data
+        parts = message_text.strip().split()
+        
+        if len(parts) != 4:  # Changed from 5 to 4
+            await whatsapp_api.send_message(
+                phone_number,
+                """❌ *Invalid Format*
+
+Please use this format:
+REGISTER [FirstName] [LastName] [ID]
+
+*Example:*
+REGISTER Thabo Mokoena 9001011234567
+
+Try again! 👆"""
+            )
+            return
+        
+        _, first_name, last_name, id_number = parts  # No PIN
+        
+        # Create flow data format (NO PIN)
+        flow_data = {
+            "first_name": first_name,
+            "last_name": last_name,
+            "id_number": id_number
+        }
+        
+        # Process registration
+        success, message, updated_user = await onboarding_service.process_flow_response(
+            phone_number,
+            flow_data,
+            db
+        )
+        
+        # Send result
+        await whatsapp_api.send_message(phone_number, message)
+        
+        # If successful, send menu
+        if success:
+            await send_menu(phone_number)
+        
+    except Exception as e:
+        logger.error(f"Registration error: {str(e)}")
+        await whatsapp_api.send_message(
+            phone_number,
+            "❌ Something went wrong during registration. Please try again or contact support."
         )
 
 
@@ -281,15 +537,19 @@ async def handle_voice_note(message: dict) -> Optional[str]:
     Download and transcribe voice note using Whisper.
     """
     try:
+        # Get media_id (preferred) or media_url
+        media_id = message.get("media_id")
         media_url = message.get("media_url")
-        if not media_url:
+        
+        if not media_id and not media_url:
+            logger.error("No media_id or media_url in voice message")
             return None
         
         # Download audio file
         audio_path = await download_media(
-            media_url,
+            media_id or media_url,
             message.get("message_id"),
-            "ogg"  # Twilio sends .ogg format
+            "ogg"  # WhatsApp sends .ogg format
         )
         
         if not audio_path:
@@ -311,18 +571,22 @@ async def handle_voice_note(message: dict) -> Optional[str]:
         return None
 
 
-async def handle_image(message: dict) -> Optional[Dict]:
+async def handle_image(message: dict, caption: str = "") -> Optional[Dict]:
     """
     Download and process image with GPT-4 Vision (OCR).
     """
     try:
+        # Get media_id (preferred) or media_url
+        media_id = message.get("media_id")
         media_url = message.get("media_url")
-        if not media_url:
+        
+        if not media_id and not media_url:
+            logger.error("No media_id or media_url in image message")
             return None
         
         # Download image
         image_path = await download_media(
-            media_url,
+            media_id or media_url,
             message.get("message_id"),
             "jpg"  # Default to jpg
         )
@@ -330,8 +594,8 @@ async def handle_image(message: dict) -> Optional[Dict]:
         if not image_path:
             return None
         
-        # Process with GPT-4 Vision
-        result = await ai_service.extract_text_from_image(str(image_path))
+        # Process with GPT-4 Vision - pass caption for context
+        result = await ai_service.extract_text_from_image(str(image_path), caption)
         
         # Clean up file
         try:
@@ -346,20 +610,37 @@ async def handle_image(message: dict) -> Optional[Dict]:
         return None
 
 
-async def download_media(media_url: str, message_id: str, extension: str) -> Optional[Path]:
+async def download_media(media_url_or_id: str, message_id: str, extension: str) -> Optional[Path]:
     """
-    Download media file from Twilio.
-    Twilio returns 307 redirects to their CDN, so we must follow them.
+    Download media file from WhatsApp API.
+    If media_url_or_id starts with digits, it's a media_id - fetch URL first.
     """
     try:
-        # Twilio media URLs require authentication
+        # Check if this is a media_id (all digits) or a URL
+        if media_url_or_id and not media_url_or_id.startswith("http"):
+            # It's a media_id, fetch the URL
+            logger.info(f"Fetching media URL for ID: {media_url_or_id}")
+            media_url = await whatsapp_api.get_media_url(media_url_or_id)
+            if not media_url:
+                logger.error("Failed to get media URL from media_id")
+                return None
+        else:
+            media_url = media_url_or_id
+        
+        if not media_url:
+            return None
+        
+        # Download media with authentication
         from app.config import settings
         
-        # CRITICAL: follow_redirects=True to handle Twilio's 307 redirects
+        headers = {
+            "Authorization": f"Bearer {settings.WHATSAPP_API_KEY}"
+        }
+        
         async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(
                 media_url,
-                auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
+                headers=headers,
                 timeout=30.0
             )
             response.raise_for_status()
@@ -379,46 +660,17 @@ async def download_media(media_url: str, message_id: str, extension: str) -> Opt
         return None
 
 
-async def send_welcome_message(phone_number: str, name: str):
-    """Send welcome message to new users."""
-    welcome = f"""👋 Hi {name}! Welcome to Cyrax!
-
-I'm your AI utility bill assistant. I can help you:
-
-💳 Buy Airtime (MTN, Vodacom, Cell C, Telkom)
-📱 Buy Data Bundles
-⚡ Pay Electricity (prepaid tokens)
-💰 Check Your Balance
-📊 View Transaction History
-
-Just tell me what you need in plain language - I understand English, voice notes, and even photos! 🎤📸
-
-Try: "Buy R50 airtime" or "Check balance"
-
-🔜 Money transfers coming soon once we get our banking license!"""
-    
-    await twilio_whatsapp.send_message(phone_number, welcome)
-
-
 async def send_menu(phone_number: str):
-    """Send menu options."""
-    menu = """📋 *What I Can Do:*
-
-1️⃣ *Buy Airtime*
-   "Buy R50 MTN airtime for 0821234567"
-
-2️⃣ *Buy Data*
-   "Buy 1GB Vodacom data"
-
-3️⃣ *Pay Electricity*
-   "Pay R100 electricity for meter 12345678901"
-
-4️⃣ *Check Balance*
-   "What's my balance?"
-
-5️⃣ *Transaction History*
-   "Show my transactions"
-
-💡 Tip: You can also send voice notes or photos of meter numbers!"""
+    """Send menu with quick reply buttons."""
+    # Show typing
+    await whatsapp_api.send_delay()
     
-    await twilio_whatsapp.send_message(phone_number, menu)
+    await whatsapp_api.send_buttons(
+        phone_number,
+        "How can I help you today?",
+        [
+            {"type": "reply", "reply": {"id": "airtime", "title": "📱 Buy Airtime"}},
+            {"type": "reply", "reply": {"id": "data", "title": "📊 Buy Data"}},
+            {"type": "reply", "reply": {"id": "electricity", "title": "⚡ Recharge Meter"}}
+        ]
+    )

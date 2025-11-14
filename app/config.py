@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4o-mini"  # Updated to faster, cheaper model
     OPENAI_VISION_MODEL: str = "gpt-4o"  # For image recognition (NEW!)
     OPENAI_WHISPER_MODEL: str = "whisper-1"  # For voice transcription (NEW!)
+
+    # Around line 45, add:
+    WHATSAPP_API_URL: str
+    WHATSAPP_API_KEY: str
+    WHATSAPP_PHONE_NUMBER_ID: str
     
     # Feature Flags (NEW!)
     ENABLE_VOICE_NOTES: bool = True
@@ -172,3 +177,5 @@ class UserStatus:
     ACTIVE = "active"
     SUSPENDED = "suspended"
     BLOCKED = "blocked" 
+
+    

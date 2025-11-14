@@ -2,6 +2,7 @@
 User Model
 Stores all user information including KYC data for FICA compliance
 """
+from sqlalchemy.orm import relationship
 from sqlalchemy import Column, String, Boolean, DateTime, Float, Integer, Enum as SQLEnum
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func
@@ -95,6 +96,9 @@ class User(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     last_active_at = Column(DateTime, default=func.now())
     verified_at = Column(DateTime, nullable=True)
+
+    # Beneficiaries
+    beneficiaries = relationship("Beneficiary", back_populates="user", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<User {self.phone_number} - {self.status}>"

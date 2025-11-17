@@ -396,6 +396,105 @@ async def process_message(message: dict, db: Session):
             if conv.ai_response:
                 conversation_history.append({"role": "assistant", "content": conv.ai_response})
         
+        # STEP 1: Classify intent using rule-based classifier (no AI hallucination)
+        from app.services.intent_classifier import classify_intent
+        from app.services.response_validator import validate_ai_response
+        
+        # Handle button responses first
+        if message_text.startswith("confirm_"):
+            # User confirmed a typo suggestion
+            action = message_text.replace("confirm_", "").replace("_", " ")
+            # Re-classify with the confirmed intent
+            message_text = action
+        elif message_text == "cancel_typo":
+            await whatsapp_api.send_message(
+                phone_number,
+                "Got it! What would you like to do?"
+            )
+            return
+        
+        classification = classify_intent(message_text, str(user.id), db)
+        logger.info(f"Intent classified: {classification['intent']} (confidence: {classification['confidence']})")
+        
+        # STEP 2: If we have a direct handler and don't need AI, execute immediately
+        if classification["handler"] and not classification["use_ai"]:
+            handler_name = classification["handler"]
+            
+            if handler_name == "handle_typo_confirmation":
+                # Ask user to confirm the typo correction
+                suggested = classification.get("suggested_intent", "")
+                await whatsapp_api.send_buttons(
+                    phone_number,
+                    f"Did you mean: *{suggested.title()}*?",
+                    [
+                        {"type": "reply", "reply": {"id": f"confirm_{suggested.replace(' ', '_')}", "title": "✅ Yes"}},
+                        {"type": "reply", "reply": {"id": "cancel_typo", "title": "❌ No"}}
+                    ]
+                )
+                return
+            
+            elif handler_name == "handle_save_beneficiary":
+                await handle_save_beneficiary(phone_number, message_text, user.id, db)
+                return
+            
+            elif handler_name == "handle_show_beneficiaries":
+                await handle_show_beneficiaries(phone_number, user.id, db)
+                return
+            
+            elif handler_name == "handle_delete_beneficiary":
+                await handle_delete_beneficiary(phone_number, message_text, user.id, db)
+                return
+            
+            elif handler_name == "handle_check_balance":
+                await whatsapp_api.send_message(
+                    phone_number,
+                    f"💰 *Wallet Balance*\n\nCurrent balance: R{user.balance:.2f}"
+                )
+                return
+            
+            elif handler_name == "handle_account_details":
+                # Show real account details from database
+                details = f"""📋 *Account Details*\n\n"""
+                details += f"Name: {user.full_name}\n"
+                details += f"Phone: {user.phone_number}\n"
+                details += f"Balance: R{user.balance:.2f}\n"
+                details += f"Status: {user.status.value}\n"
+                if user.is_fica_compliant:
+                    details += f"✅ Verified\n"
+                else:
+                    details += f"⚠️ Not verified\n"
+                # Don't show account number if not available
+                if user.account_number:
+                    details += f"Account: {user.account_number}\n"
+                
+                await whatsapp_api.send_message(phone_number, details)
+                return
+            
+            elif handler_name == "send_menu":
+                await send_menu(phone_number)
+                return
+            
+            elif handler_name == "handle_beneficiary_transaction":
+                await handle_beneficiary_transaction(
+                    phone_number, 
+                    message_text, 
+                    user.id, 
+                    classification["entities"],
+                    db
+                )
+                return
+            
+            elif handler_name == "handle_buy_airtime":
+                await handle_buy_airtime(
+                    phone_number,
+                    message_text,
+                    user.id,
+                    classification["entities"],
+                    db
+                )
+                return
+        
+        # STEP 3: Only use AI if needed (incomplete requests or unclear intent)
         # Process with AI
         ai_result = await ai_service.process_message(
             message_text,
@@ -412,8 +511,13 @@ async def process_message(message: dict, db: Session):
         conversation.processed_at = datetime.utcnow()
         db.commit()
         
-        # Send AI response
-        await whatsapp_api.send_message(phone_number, ai_result["response"])
+        # STEP 4: Validate AI response (catch hallucinations)
+        is_valid, final_response = validate_ai_response(ai_result["response"])
+        if not is_valid:
+            logger.warning(f"Hallucination caught and corrected")
+        
+        # Send validated response
+        await whatsapp_api.send_message(phone_number, final_response)
         
         # Handle specific intents - only send menu for actual help requests
         if ai_result["intent"] == "help":
@@ -422,6 +526,16 @@ async def process_message(message: dict, db: Session):
             # Only send menu if this is first message (no conversation history)
             if len(conversation_history) == 0:
                 await send_menu(phone_number)
+        
+        # Handle beneficiary intents
+        elif ai_result["intent"] == "save_beneficiary":
+            await handle_save_beneficiary(phone_number, message_text, user.id, db)
+        
+        elif ai_result["intent"] == "show_beneficiaries":
+            await handle_show_beneficiaries(phone_number, user.id, db)
+        
+        elif ai_result["intent"] == "delete_beneficiary":
+            await handle_delete_beneficiary(phone_number, message_text, user.id, db)
         
     except Exception as e:
         logger.error(f"Message processing error: {str(e)}", exc_info=True)
@@ -672,5 +786,233 @@ async def send_menu(phone_number: str):
             {"type": "reply", "reply": {"id": "airtime", "title": "📱 Buy Airtime"}},
             {"type": "reply", "reply": {"id": "data", "title": "📊 Buy Data"}},
             {"type": "reply", "reply": {"id": "electricity", "title": "⚡ Recharge Meter"}}
+        ]
+    )
+
+
+async def handle_save_beneficiary(phone_number: str, message: str, user_id: str, db: Session):
+    """Handle 'save [nickname] [number]' command with flexible parsing"""
+    from app.services.beneficiary_service import beneficiary_service
+    from app.models.beneficiary import BeneficiaryType
+    import re
+    
+    # Remove command words and clean up
+    text = message.lower()
+    text = text.replace("save beneficiary", "").replace("save", "").strip()
+    text = text.replace(" number ", " ").replace(" meter ", " ").strip()
+    
+    # Split into parts
+    parts = text.split()
+    
+    if len(parts) < 2:
+        await whatsapp_api.send_message(
+            phone_number,
+            "Please use format:\n• save [name] [number]\n\nExamples:\n• save thabo 0821234567\n• save home meter 12345678901\n• save mom number 0827654321"
+        )
+        return
+    
+    # Last part is the number/account, rest is nickname
+    value = parts[-1]
+    nickname_parts = parts[:-1]
+    nickname = " ".join(nickname_parts)
+    
+    # Auto-detect type
+    is_meter = len(value) == 11 and value.isdigit()
+    is_phone = bool(re.match(r'^(\+27|0)\d{9}$', value.replace("+", "")))
+    
+    if is_meter:
+        btype = BeneficiaryType.METER
+    elif is_phone:
+        btype = BeneficiaryType.PHONE
+    elif "water" in nickname:
+        btype = BeneficiaryType.WATER
+    elif "wifi" in nickname or "internet" in nickname:
+        btype = BeneficiaryType.INTERNET
+    elif "dstv" in nickname or "tv" in nickname:
+        btype = BeneficiaryType.TV
+    elif "municipal" in nickname or "council" in nickname:
+        btype = BeneficiaryType.MUNICIPAL
+    else:
+        btype = BeneficiaryType.OTHER
+    
+    # Clean phone number if needed
+    if is_phone and not value.startswith("+"):
+        if value.startswith("0"):
+            value = "+27" + value[1:]
+    
+    # Save
+    success, msg, beneficiary = beneficiary_service.save_beneficiary(
+        user_id=user_id,
+        nickname=nickname,
+        value=value,
+        beneficiary_type=btype,
+        network=None,
+        db=db
+    )
+    
+    await whatsapp_api.send_message(phone_number, msg)
+
+
+async def handle_show_beneficiaries(phone_number: str, user_id: str, db: Session):
+    """Show all saved beneficiaries"""
+    from app.services.beneficiary_service import beneficiary_service
+    
+    beneficiaries = beneficiary_service.get_beneficiaries(user_id, None, db)
+    message = beneficiary_service.format_beneficiary_list(beneficiaries)
+    
+    await whatsapp_api.send_message(phone_number, message)
+
+
+async def handle_delete_beneficiary(phone_number: str, message: str, user_id: str, db: Session):
+    """Handle 'delete [nickname]' command"""
+    from app.services.beneficiary_service import beneficiary_service
+    
+    # Parse: "delete thabo" or "remove mom"
+    nickname = message.lower().replace("delete ", "").replace("remove ", "").strip()
+    
+    if not nickname:
+        await whatsapp_api.send_message(
+            phone_number,
+            "Please specify which beneficiary to delete.\n\nExample: delete thabo"
+        )
+        return
+    
+    success, msg = beneficiary_service.delete_beneficiary(user_id, nickname, db)
+    await whatsapp_api.send_message(phone_number, msg)
+
+
+async def handle_beneficiary_transaction(
+    phone_number: str, 
+    message: str, 
+    user_id: str,
+    entities: dict,
+    db: Session
+):
+    """
+    Handle transaction with saved beneficiary.
+    Deterministic flow - no AI hallucination.
+    """
+    beneficiary = entities.get("beneficiary")
+    amount = entities.get("amount")
+    
+    if not beneficiary:
+        await whatsapp_api.send_message(phone_number, "Beneficiary not found.")
+        return
+    
+    # Get user for balance check
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    # If amount missing, ask for it
+    if not amount:
+        await whatsapp_api.send_message(
+            phone_number,
+            f"How much for {beneficiary.nickname}?\n\nExample: R50, R100, R200"
+        )
+        return
+    
+    # Check balance
+    if user.balance < amount:
+        await whatsapp_api.send_message(
+            phone_number,
+            f"💰 Insufficient balance\n\nYou have: R{user.balance:.2f}\nYou need: R{amount:.2f}\n\nPlease top up your wallet."
+        )
+        return
+    
+    # Determine transaction type
+    if beneficiary.beneficiary_type.value == "phone":
+        transaction_type = "airtime"
+        icon = "📱"
+    elif beneficiary.beneficiary_type.value == "meter":
+        transaction_type = "electricity"
+        icon = "⚡"
+    else:
+        transaction_type = "utility"
+        icon = "💳"
+    
+    # Send confirmation with buttons
+    await whatsapp_api.send_buttons(
+        phone_number,
+        f"{icon} *Confirm Purchase*\n\n• For: {beneficiary.nickname}\n• Account: {beneficiary.value}\n• Amount: R{amount:.2f}\n• Type: {transaction_type.title()}\n\nProceed?",
+        [
+            {"type": "reply", "reply": {"id": "yes_confirm", "title": "✅ Yes"}},
+            {"type": "reply", "reply": {"id": "no", "title": "❌ No"}}
+        ]
+    )
+
+
+async def handle_buy_airtime(
+    phone_number: str,
+    message_text: str,
+    user_id: str,
+    entities: dict,
+    db: Session
+):
+    """
+    Handle airtime purchase - deterministic, step-by-step.
+    NO AI HALLUCINATION.
+    """
+    from app.services.intent_classifier import extract_amount, extract_phone, extract_network
+    
+    # Extract entities from message
+    amount = entities.get("amount") or extract_amount(message_text)
+    phone = entities.get("phone") or extract_phone(message_text)
+    network = entities.get("network") or extract_network(message_text)
+    
+    # Get user
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    # Step 1: Check what's missing
+    missing = []
+    if not network:
+        missing.append("network")
+    if not amount:
+        missing.append("amount")
+    if not phone:
+        missing.append("phone number")
+    
+    # If anything missing, ask for it
+    if missing:
+        if "network" in missing and "amount" in missing:
+            await whatsapp_api.send_message(
+                phone_number,
+                "Which network and how much?\n\nExample: R20 MTN"
+            )
+        elif "phone number" in missing:
+            await whatsapp_api.send_message(
+                phone_number,
+                f"For which number?\n\nExample: 0821234567"
+            )
+        elif "amount" in missing:
+            await whatsapp_api.send_message(
+                phone_number,
+                f"How much {network} airtime?\n\nExample: R20, R50, R100"
+            )
+        elif "network" in missing:
+            await whatsapp_api.send_buttons(
+                phone_number,
+                "Which network?",
+                [
+                    {"type": "reply", "reply": {"id": "mtn", "title": "MTN"}},
+                    {"type": "reply", "reply": {"id": "vodacom", "title": "Vodacom"}},
+                    {"type": "reply", "reply": {"id": "cell_c", "title": "Cell C"}}
+                ]
+            )
+        return
+    
+    # Step 2: All info present - check balance
+    if user.balance < amount:
+        await whatsapp_api.send_message(
+            phone_number,
+            f"⚠️ *Insufficient Balance*\n\nYou have: R{user.balance:.2f}\nYou need: R{amount:.2f}\n\nPlease top up to continue."
+        )
+        return
+    
+    # Step 3: Send confirmation buttons
+    await whatsapp_api.send_buttons(
+        phone_number,
+        f"📱 *Confirm Airtime Purchase*\n\n• Network: {network.title()}\n• Phone: {phone}\n• Amount: R{amount:.2f}\n\nProceed?",
+        [
+            {"type": "reply", "reply": {"id": f"confirm_airtime_{network}_{phone}_{amount}", "title": "✅ Confirm"}},
+            {"type": "reply", "reply": {"id": "cancel", "title": "❌ Cancel"}}
         ]
     )
